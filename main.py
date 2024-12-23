@@ -1,117 +1,161 @@
-import boto3
 import os
-import subprocess
 from io import BytesIO
-from botocore.exceptions import SSLError
+from typing import Dict, Any, List
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError, SSLError
 
-def check_env_var(var_name):
-    value = os.environ.get(var_name)
-    if not value:
-        log_message("ENV CHECK", "ERROR", f"Environment variable '{var_name}' is not set.")
-    return value.strip().replace("https://", "").replace("http://", "").split(":")[0] + ":443"
+def get_aws_config() -> Dict[str, str]:
+    required_vars = [
+        'AWS_ACCESS_KEY_ID',
+        'AWS_SECRET_ACCESS_KEY',
+        'AWS_DEFAULT_REGION',
+        'AWS_S3_ENDPOINT',
+        'AWS_S3_BUCKET'
+    ]
+    config = {}
+    missing_vars = [var for var in required_vars if var not in os.environ]
+    if missing_vars:
+        print(f"Missing environment variables: {', '.join(missing_vars)}")
+        exit(1)
+    for var in required_vars:
+        config[var.lower()] = os.environ[var]
+    return config
 
+def create_s3_client(config: Dict[str, str], desc: str) -> Any:
+    endpoint = config['aws_s3_endpoint']
+    cert_bundle = os.environ.get('AWS_CA_BUNDLE')
+    
+    # Decide based on the desired connection type:
+    if desc == "tls_default":
+        # Always HTTPS with default cert, ignore custom bundle
+        use_http = False
+        verify = True
+        connection_desc = "HTTPS with default SSL"
+    elif desc == "tls_custom_bundle":
+        # HTTPS, use custom CA if available
+        use_http = False
+        verify = cert_bundle if cert_bundle else True
+        connection_desc = (
+            "HTTPS with custom CA bundle"
+            if cert_bundle else
+            "HTTPS with default SSL (no custom bundle found)"
+        )
+    elif desc == "http_connection":
+        # HTTP, no certificate
+        use_http = True
+        verify = False
+        connection_desc = "HTTP with no SSL/TLS"
+    else:
+        # Fallback: treat as default
+        use_http = False
+        verify = True
+        connection_desc = "HTTPS with default SSL"
 
-def log_message(step, status, message):
-    print(f"[{step}] [{status}] {message}")
+    # Switch endpoint to http if needed
+    if use_http and endpoint.startswith("https://"):
+        endpoint = endpoint.replace("https://", "http://", 1)
 
-
-def connect_to_s3(verify_ssl=True):
-    cert_bundle_path = os.environ.get('AWS_CA_BUNDLE')
-    if cert_bundle_path:
-        log_message("CONFIG", "INFO", f"Using custom CA bundle: {cert_bundle_path}")
-    return boto3.client(
-        's3',
-        aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
-        aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
-        region_name=os.environ['AWS_DEFAULT_REGION'],
-        endpoint_url=f"https://{os.environ['AWS_S3_ENDPOINT']}",
-        verify=cert_bundle_path if cert_bundle_path else verify_ssl
-    )
-
-
-def perform_ssl_check():
-    log_message("SSL CHECK", "INFO", "Attempting custom CA bundle creation using OpenSSL...")
-    subprocess.run(
-        f"openssl s_client -connect {os.environ['AWS_S3_ENDPOINT']} -showcerts </dev/null 2>/dev/null | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > storage.crt",
-        shell=True,
-        check=True
-    )
-    os.environ['AWS_CA_BUNDLE'] = "storage.crt"
-
-
-# Initialize Environment Variables
-AWS_S3_ENDPOINT = check_env_var('AWS_S3_ENDPOINT')
-os.environ['AWS_S3_ENDPOINT'] = AWS_S3_ENDPOINT
-
-# Check S3 Connection
-ssl_failed = False
-cert_bundle_used = False
-log_message("Step 1", "INFO", "Connecting to the S3 bucket with SSL...")
-
-try:
-    s3 = connect_to_s3()
-    s3.list_buckets()
-    log_message("Step 1", "SUCCESS", "Successfully verified SSL connection.")
-except SSLError:
-    log_message("Step 1", "ERROR", "SSL connection using default CA failed.")
-    log_message("Step 1", "INFO", "Generating storage.crt using OpenSSL...")
     try:
-        perform_ssl_check()
-        cert_bundle_used = True
-        s3 = connect_to_s3()
-        s3.list_buckets()
-        log_message("Step 1", "SUCCESS", "Connected using custom CA bundle (storage.crt).")
-    except SSLError:
-        ssl_failed = True
-        log_message("Step 1", "INFO", "Retrying connection without SSL verification...")
-        try:
-            s3 = connect_to_s3(verify_ssl=False)
-            log_message("Step 1", "SUCCESS", "Connected to the S3 bucket without SSL.")
-        except Exception as e:
-            log_message("Step 1", "ERROR", f"Connection failed: {e.__class__.__name__}: {e}")
-            raise e
+        client = boto3.client(
+            's3',
+            aws_access_key_id=config['aws_access_key_id'],
+            aws_secret_access_key=config['aws_secret_access_key'],
+            region_name=config['aws_default_region'],
+            endpoint_url=endpoint,
+            verify=verify
+        )
+        print(f"Created S3 client using {connection_desc}.")
+        return client
+    except (BotoCoreError, ClientError, SSLError) as e:
+        print(f"Failed to create S3 client: {e}")
+        exit(1)
 
-# Perform S3 Tasks
-content = b"Sample in-memory file content for testing."
-file_stream = BytesIO(content)
-
-for step, action, task in [
-    ("Step 2", "Uploading file...", lambda: s3.upload_fileobj(file_stream, os.environ['AWS_S3_BUCKET'], 'memory_file.txt')),
-    ("Step 3", "Downloading file...", lambda: s3.download_fileobj(os.environ['AWS_S3_BUCKET'], 'memory_file.txt', BytesIO())),
-    ("Step 4", "Creating folder...", lambda: s3.put_object(Bucket=os.environ['AWS_S3_BUCKET'], Key='new_folder/')),
-    ("Step 5", "Listing files...", lambda: s3.list_objects_v2(Bucket=os.environ['AWS_S3_BUCKET'], Prefix='new_folder/'))
-]:
-    log_message(step, "INFO", action)
+def perform_s3_tasks(client: Any, bucket: str, folder: str, content: bytes) -> str:
+    file_name = f"file_{folder.strip('/').replace('/', '_')}.txt"
+    file_key = f"{folder}{file_name}"
     try:
-        result = task()
-        if step == "Step 5":
-            for obj in result.get('Contents', []):
-                log_message(step, "FILE", obj['Key'])
-        log_message(step, "SUCCESS", f"{action} completed successfully.")
+        client.put_object(Bucket=bucket, Key=folder)
+        print(f"Created folder: {folder}")
+
+        client.upload_fileobj(BytesIO(content), bucket, file_key)
+        print(f"Uploaded file: {file_key}")
+
+        download_buffer = BytesIO()
+        client.download_fileobj(bucket, file_key, download_buffer)
+        downloaded_content = download_buffer.getvalue()
+        if downloaded_content != content:
+            raise ValueError("Downloaded content does not match uploaded content.")
+        print(f"Downloaded and verified file: {file_key}")
+
+        return file_key
     except Exception as e:
-        log_message(step, "ERROR", f"{action} failed: {e.__class__.__name__}: {e}")
+        print(f"Error during S3 tasks for {folder}: {e}")
+        raise
 
-# Summary Message
-final_messages = []
-if ssl_failed:
-    final_messages.append("SSL connection failed. Connected using HTTP instead.")
+def list_all_files(client: Any, bucket: str) -> List[str]:
+    try:
+        paginator = client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket)
+        return [obj['Key'] for page in pages for obj in page.get('Contents', [])]
+    except (BotoCoreError, ClientError) as e:
+        print(f"Failed to list all files: {e}")
+        return []
 
-if cert_bundle_used:
-    final_messages.append(
-        "SSL connection succeeded using a custom CA bundle (storage.crt).\n"
-        "Refer to AWS documentation for configuring CA bundles:\n"
-        "https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html#cli-configure-files-settings"
-    )
+def cleanup(client: Any, bucket: str, keys: List[str]) -> None:
+    for key in keys:
+        try:
+            client.delete_object(Bucket=bucket, Key=key)
+            print(f"Deleted: {key}")
+        except (BotoCoreError, ClientError) as e:
+            print(f"Failed to delete {key}: {e}")
 
-final_messages.append(
-    "Consider the following actions:\n"
-    "1. Provide a Custom CA Bundle. Learn more: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html#cli-configure-files-settings\n"
-    "2. Correct the Certificate Chain. Refer to Kubernetes/OpenShift documentation:\n"
-    "https://kubernetes.io/docs/tasks/tls/managing-tls-in-a-cluster/\n"
-    "https://docs.openshift.com/container-platform/4.17/security/certificates/updating-ca-bundle.html"
-)
+def main():
+    config = get_aws_config()
+    bucket = config['aws_s3_bucket']
+    scenarios = [
+        {
+            "desc": "tls_default",
+            "content": b"Content for TLS default connection."
+        },
+        {
+            "desc": "tls_custom_bundle",
+            "content": b"Content for TLS with custom certificate bundle."
+        },
+        {
+            "desc": "http_connection",
+            "content": b"Content for HTTP connection."
+        }
+    ]
 
-# Print Final Messages
-for message in final_messages:
-    log_message("FINAL MESSAGE", "INFO", message)
+    created_keys = []
+    for scenario in scenarios:
+        print(f"\nTesting configuration: {scenario['desc']}")
+        try:
+            client = create_s3_client(config, scenario['desc'])
+            folder = f"test/{scenario['desc']}/"
+            file_key = perform_s3_tasks(client, bucket, folder, scenario['content'])
+            created_keys.extend([folder, file_key])
+        except Exception:
+            print(f"Skipping cleanup for {scenario['desc']} due to errors.")
+
+    print("\nAll files in bucket:")
+    try:
+        client = create_s3_client(config, "tls_default")  # Just to list, default TLS is fine
+        all_files = list_all_files(client, bucket)
+        for file in all_files:
+            print(f" - {file}")
+    except Exception as e:
+        print(f"Failed to list all files: {e}")
+
+    print("\nStarting cleanup...")
+    try:
+        client = create_s3_client(config, "tls_default")
+        cleanup(client, bucket, created_keys)
+    except Exception as e:
+        print(f"Cleanup failed: {e}")
+
+    print("\nScript execution completed.")
+
+if __name__ == "__main__":
+    main()
