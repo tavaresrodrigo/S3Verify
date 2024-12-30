@@ -29,4 +29,4 @@ This repository contains scripts and notebooks for verifying S3 connectivity, do
 Submit issues or pull requests to improve the tool.
 
 ## License
-This project is licensed under the MIT License." > README.md
+This project is licensed under the MIT License.
